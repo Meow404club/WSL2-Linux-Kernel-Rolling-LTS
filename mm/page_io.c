@@ -25,7 +25,18 @@
 #include <linux/sched/task.h>
 #include <linux/delayacct.h>
 #include <linux/zswap.h>
+#include <linux/kfifo.h>
+#include <linux/lru_marie.h>
 #include "swap.h"
+
+#ifdef CONFIG_LRU_MARIE
+/*
+ * Counter consumed by the early-OOM gate in
+ * mm/page_alloc.c:should_reclaim_retry. Declared in include/linux/swap.h.
+ * Marie-only: omitted entirely under CONFIG_LRU_MARIE=n.
+ */
+atomic_long_t nr_swap_write_failed = ATOMIC_LONG_INIT(0);
+#endif
 
 static void __end_swap_bio_write(struct bio *bio)
 {
@@ -39,7 +50,21 @@ static void __end_swap_bio_write(struct bio *bio)
 		 * very quickly.
 		 *
 		 * Also clear PG_reclaim to avoid folio_rotate_reclaimable()
+		 *
+		 * Bump nr_swap_write_failed so the early-OOM gate in
+		 * should_reclaim_retry can short-circuit the
+		 * MAX_RECLAIM_RETRIES wait when the swap backend (most
+		 * commonly ZRAM/zswap zs_malloc, or a real disk error) has
+		 * stopped accepting writes — anon reclaim is doomed in that
+		 * state regardless of get_nr_swap_pages() reporting free
+		 * entries. Marie-only signal; vanilla MGLRU/Legacy builds
+		 * (lru_marie_enabled()=false) skip the counter bump so the
+		 * baseline allocator sees vanilla retry behaviour.
 		 */
+#ifdef CONFIG_LRU_MARIE
+		if (lru_marie_enabled())
+			atomic_long_inc(&nr_swap_write_failed);
+#endif
 		folio_mark_dirty(folio);
 		pr_alert_ratelimited("Write-error on swap-device (%u:%u:%llu)\n",
 				     MAJOR(bio_dev(bio)), MINOR(bio_dev(bio)),
@@ -48,6 +73,28 @@ static void __end_swap_bio_write(struct bio *bio)
 	}
 	folio_end_writeback(folio);
 }
+
+#ifdef CONFIG_LRU_MARIE
+/* Multi-folio variant of __end_swap_bio_write() for coalesced swap bios. */
+static void __end_swap_bio_write_batch(struct bio *bio)
+{
+	struct folio_iter fi;
+
+	if (bio->bi_status) {
+		bio_for_each_folio_all(fi, bio) {
+			if (lru_marie_enabled())
+				atomic_long_inc(&nr_swap_write_failed);
+			folio_mark_dirty(fi.folio);
+			folio_clear_reclaim(fi.folio);
+		}
+		pr_alert_ratelimited("Write-error on swap-device (%u:%u:%llu)\n",
+			MAJOR(bio_dev(bio)), MINOR(bio_dev(bio)),
+			(unsigned long long)bio->bi_iter.bi_sector);
+	}
+	bio_for_each_folio_all(fi, bio)
+		folio_end_writeback(fi.folio);
+}
+#endif /* CONFIG_LRU_MARIE */
 
 static void end_swap_bio_write(struct bio *bio)
 {
@@ -234,6 +281,173 @@ static void swap_zeromap_folio_clear(struct folio *folio)
 }
 
 /*
+ * do_swapout() - Write a folio to swap space
+ * @folio: The folio to write out
+ *
+ * This function writes the folio to swap space, either using zswap or
+ * synchronous write. It ensures that the folio is unlocked and the
+ * reference count is decremented after the operation.
+ */
+static inline void do_swapout(struct folio *folio, struct swap_iocb **swap_plug)
+{
+	if (zswap_store(folio)) {
+		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
+		folio_unlock(folio);
+	} else
+		__swap_writepage(folio, swap_plug); /* Implies folio_unlock(folio) */
+
+	/* Decrement the folio reference count */
+	folio_put(folio);
+}
+
+#ifdef CONFIG_LRU_MARIE
+/* Forward decl: defined below, after swap_writepage_bdev_sync(). */
+static void swap_writepage_bdev_sync_batch(struct folio **folios,
+		unsigned int n, struct swap_info_struct *sis);
+
+/*
+ * do_swapout_batch() - Write a drained batch of folios to swap.
+ *
+ * Partitions the batch into runs eligible for bio-coalescing (same
+ * swap_info_struct, all anon, zswap off, SWP_SYNCHRONOUS_IO) and
+ * dispatches each such run through swap_writepage_bdev_sync_batch() --
+ * one multi-segment bio per contiguous-slot run instead of one bio per
+ * folio. Folios that don't qualify (zswap on, non-anon, non-sync-IO
+ * device) fall back to the per-folio do_swapout() path unchanged.
+ */
+static void do_swapout_batch(struct folio **folios, unsigned int n,
+			     struct swap_iocb **swap_plug)
+{
+	unsigned int i = 0;
+
+	while (i < n) {
+		struct folio *f = folios[i];
+		struct swap_info_struct *sis = __swap_entry_to_info(f->swap);
+
+		/* zswap on, non-anon, or non-sync-IO block dev -> per-folio. */
+		if (zswap_is_enabled() || !folio_test_anon(f) ||
+		    !data_race(sis->flags & SWP_SYNCHRONOUS_IO)) {
+			do_swapout(f, swap_plug);
+			i++;
+			continue;
+		}
+
+		/* Build a same-sis run. */
+		{
+			unsigned int start = i;
+
+			while (i < n) {
+				struct folio *g = folios[i];
+
+				if (__swap_entry_to_info(g->swap) != sis ||
+				    !folio_test_anon(g) ||
+				    zswap_is_enabled())
+					break;
+				i++;
+			}
+			swap_writepage_bdev_sync_batch(&folios[start], i - start,
+						       sis);
+			/* drop the refs kcompressd_store took (do_swapout would). */
+			for (unsigned int j = start; j < i; j++)
+				folio_put(folios[j]);
+		}
+	}
+}
+
+/*
+ * kcompressd_store() - Off-load folio compression to kcompressd
+ * @folio: The folio to compress
+ *
+ * This function attempts to off-load the compression of the folio to
+ * kcompressd. If kcompressd is not available or the folio cannot be
+ * compressed, it falls back to synchronous write.
+ *
+ * Returns true if the folio was successfully queued for compression,
+ * false otherwise.
+ */
+static bool kcompressd_store(struct folio *folio, struct swap_iocb **swap_plug)
+{
+	pg_data_t *pgdat = NODE_DATA(numa_node_id());
+	unsigned int ret;
+	struct folio *head = NULL;
+
+	/* Only kswapd can use kcompressd */
+	if (!current_is_kswapd())
+		return false;
+
+	/* Mode 0, or mode 1 with Marie off — short-circuit on the static branches. */
+	if (!kcompressd_active())
+		return false;
+
+	/* kthread must be running */
+	if (unlikely(!pgdat->kcompressd))
+		return false;
+
+	/* We can only off-load anon folios */
+	if (!folio_test_anon(folio))
+		return false;
+
+	/* Fall back to synchronously return AOP_WRITEPAGE_ACTIVATE.
+	 * folio_memcg -> obj_cgroup_memcg requires RCU read-side held to
+	 * keep objcg from being freed by a concurrent memcg teardown
+	 * (lockdep_assert_once in obj_cgroup_memcg). */
+	{
+		bool zswap_wb_ok;
+
+		rcu_read_lock();
+		zswap_wb_ok = mem_cgroup_zswap_writeback_enabled(folio_memcg(folio));
+		rcu_read_unlock();
+		if (!zswap_wb_ok)
+			return false;
+	}
+
+	/* Swap device must be sync-efficient */
+	if (!zswap_is_enabled() &&
+		!data_race(__swap_entry_to_info(folio->swap)->flags & SWP_SYNCHRONOUS_IO))
+		return false;
+
+	/*
+	 * The kfifo backing storage is sized at KCOMPRESSD_FIFO_SIZE (the
+	 * compile-time max). The effective queue depth is |vm_kcompressd|;
+	 * when current depth meets or exceeds that, treat the queue as
+	 * full and swap out the head folio synchronously to make space.
+	 */
+	scoped_guard(spinlock_irqsave, &pgdat->kcompressd_fifo_lock)
+		if (kfifo_len(&pgdat->kcompressd_fifo) >=
+			abs(READ_ONCE(vm_kcompressd)) * sizeof(struct folio *) &&
+			unlikely(!kfifo_out(&pgdat->kcompressd_fifo,
+					&head, sizeof(folio))))
+			return false;
+
+	/* Increment the folio reference count to avoid it being freed */
+	folio_get(folio);
+
+	/* Enqueue the folio for compression */
+	ret = kfifo_in(&pgdat->kcompressd_fifo, &folio, sizeof(folio));
+	if (likely(ret))
+		/* We successfully enqueued the folio. wake up kcompressd */
+		wake_up_interruptible(&pgdat->kcompressd_wait);
+	else
+		/* Enqueue failed, so we must cancel the reference count */
+		folio_put(folio);
+
+	/* If we had to swap out the head folio, do it now.
+	 * This will block until the folio is written out.
+	 */
+	if (head)
+		do_swapout(head, swap_plug);
+
+	return ret;
+}
+#else  /* !CONFIG_LRU_MARIE */
+static inline bool kcompressd_store(struct folio *folio,
+				   struct swap_iocb **swap_plug)
+{
+	return false;
+}
+#endif
+
+/*
  * We may have stale swap cache pages in memory: notice
  * them here and get rid of the unnecessary final write.
  */
@@ -272,6 +486,14 @@ int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
 	 */
 	swap_zeromap_folio_clear(folio);
 
+	/*
+	 * Compression within zswap and zram might block rmap, unmap
+	 * of both file and anon pages, try to do compression async
+	 * if possible
+	 */
+	if (kcompressd_store(folio, swap_plug))
+		return 0;
+
 	if (zswap_store(folio)) {
 		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
 		goto out_unlock;
@@ -287,6 +509,72 @@ out_unlock:
 	folio_unlock(folio);
 	return ret;
 }
+
+#ifdef CONFIG_LRU_MARIE
+/*
+ * Batch-drain size for kcompressd(): reuses the existing |vm_kcompressd|
+ * queue-depth knob (no separate batch-size knob) clamped to a sane range
+ * for the stack-allocated drain array.
+ */
+static inline unsigned int kcompressd_drain_depth(void)
+{
+	int d = abs(READ_ONCE(vm_kcompressd));
+
+	if (d < 1)
+		return 1;
+	if (d > SWAP_CLUSTER_MAX)
+		return SWAP_CLUSTER_MAX;
+	return d;
+}
+
+/*
+ * kcompressd() - Kernel thread for compressing folios
+ * @p: Pointer to pg_data_t structure
+ *
+ * This function runs in a kernel thread and waits for folios to be
+ * queued for compression. It drains its fifo in batches and dispatches
+ * each batch through do_swapout_batch(), which coalesces same-device
+ * contiguous-slot folios into multi-segment bios (see Stage 1 above).
+ */
+int kcompressd(void *p)
+{
+	pg_data_t *pgdat = (pg_data_t *)p;
+	struct folio *batch[SWAP_CLUSTER_MAX];
+	unsigned int n;
+
+	/* * kcompressd runs with PF_MEMALLOC and PF_KSWAPD flags set to
+	 * allow it to allocate memory for compression without being
+	 * restricted by the current memory allocation context.
+	 * Also PF_KSWAPD prevents Intel Graphics driver from crashing
+	 * the system in i915_gem_shrinker.c:i915_gem_shrinker_scan()
+	 */
+	current->flags |= PF_MEMALLOC | PF_KSWAPD;
+
+	while (!kthread_should_stop()) {
+		wait_event_interruptible(pgdat->kcompressd_wait,
+				!kfifo_is_empty(&pgdat->kcompressd_fifo));
+
+		for (;;) {
+			n = kfifo_out_locked(&pgdat->kcompressd_fifo,
+				batch,
+				kcompressd_drain_depth() * sizeof(*batch),
+				&pgdat->kcompressd_fifo_lock)
+					/ sizeof(*batch);
+			if (!n)
+				break;
+			/*
+			 * kcompressd is async reclaim writeback; pass a NULL
+			 * swap_plug so do_swapout_batch's per-folio fallback
+			 * (do_swapout) submits each folio's bio immediately
+			 * rather than batching it on a plug the caller would
+			 * have to unplug.
+			 */
+			do_swapout_batch(batch, n, NULL);
+		}
+	}
+	return 0;
+}
+#endif /* CONFIG_LRU_MARIE */
 
 static inline void count_swpout_vm_event(struct folio *folio)
 {
@@ -426,6 +714,49 @@ static void swap_writepage_bdev_sync(struct folio *folio,
 	submit_bio_wait(&bio);
 	__end_swap_bio_write(&bio);
 }
+
+#ifdef CONFIG_LRU_MARIE
+/*
+ * Stage 1: coalesce a run of folios with *physically contiguous* swap slots
+ * into one multi-segment bio and submit_bio_wait() it once. Non-contiguous
+ * folios start a new bio (graceful fallback to the per-folio granularity).
+ */
+static void swap_writepage_bdev_sync_batch(struct folio **folios,
+		unsigned int n, struct swap_info_struct *sis)
+{
+	unsigned int i = 0;
+
+	while (i < n) {
+		struct bio *bio;
+		sector_t next = swap_folio_sector(folios[i]);
+		unsigned int start = i, segs = 0;
+
+		/* Grow the contiguous run [start, i). */
+		while (i < n && swap_folio_sector(folios[i]) == next &&
+		       segs < BIO_MAX_VECS) {
+			next += (folio_nr_pages(folios[i]) << (PAGE_SHIFT - 9));
+			segs++;
+			i++;
+		}
+
+		bio = bio_alloc(sis->bdev, segs,
+				REQ_OP_WRITE | REQ_SWAP,
+				GFP_NOIO);
+		bio->bi_iter.bi_sector = swap_folio_sector(folios[start]);
+		bio_associate_blkg_from_page(bio, folios[start]);
+		for (unsigned int j = start; j < i; j++) {
+			count_swpout_vm_event(folios[j]);
+			folio_start_writeback(folios[j]);
+			folio_unlock(folios[j]);
+			bio_add_folio_nofail(bio, folios[j],
+					     folio_size(folios[j]), 0);
+		}
+		submit_bio_wait(bio);
+		__end_swap_bio_write_batch(bio);
+		bio_put(bio);
+	}
+}
+#endif /* CONFIG_LRU_MARIE */
 
 static void swap_writepage_bdev_async(struct folio *folio,
 		struct swap_info_struct *sis)

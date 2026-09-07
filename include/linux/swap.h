@@ -450,6 +450,24 @@ extern atomic_long_t nr_swap_pages;
 extern long total_swap_pages;
 extern atomic_t nr_rotate_swap;
 
+#ifdef CONFIG_LRU_MARIE
+/*
+ * linux/mm/page_io.c: monotonic counter incremented on every failed swap-out
+ * bio completion (bio->bi_status != 0). The early-OOM gate in
+ * mm/page_alloc.c:should_reclaim_retry consults the delta from
+ * alloc_context.initial_swap_write_failed to detect "swap backend has free
+ * entries but cannot actually write" — primarily ZRAM/zswap zs_malloc
+ * failures under combined RAM + swap pressure, but also disk swap I/O
+ * errors. Sustained delta > MAX_SWAP_WRITE_FAIL_RETRIES skips the standard
+ * MAX_RECLAIM_RETRIES wait and triggers OOM directly.
+ *
+ * Marie-only: only the Marie-gated path in should_reclaim_retry consumes
+ * this counter, so it is omitted entirely under CONFIG_LRU_MARIE=n to
+ * keep vanilla MGLRU/Legacy builds byte-identical.
+ */
+extern atomic_long_t nr_swap_write_failed;
+#endif
+
 /* Swap 50% full? Release swapcache more aggressively.. */
 static inline bool vm_swap_full(void)
 {

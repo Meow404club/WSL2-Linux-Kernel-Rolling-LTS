@@ -11,6 +11,7 @@
 #include <linux/khugepaged.h>
 #include <linux/mm.h>
 #include <linux/mm_inline.h>
+#include <linux/page-isolation.h>	/* enum pb_isolate_mode, for has_unmovable_pages() */
 #include <linux/pagemap.h>
 #include <linux/pagewalk.h>
 #include <linux/rmap.h>
@@ -531,12 +532,67 @@ extern unsigned long highest_memmap_pfn;
  */
 #define MAX_RECLAIM_RETRIES 16
 
+#ifdef CONFIG_LRU_MARIE
+/*
+ * Maximum number of swap-write failures (incremented by mm/page_io.c
+ * __end_swap_bio_write on bio->bi_status != 0) tolerated within a single
+ * __alloc_pages_slowpath attempt before the early-OOM gate gives up. Lets
+ * a handful of transient failures (concurrent ZRAM ops, brief retry
+ * windows) recover, but trips OOM well before MAX_RECLAIM_RETRIES on
+ * sustained backend rejection. Marie-only; omitted under
+ * CONFIG_LRU_MARIE=n.
+ */
+#define MAX_SWAP_WRITE_FAIL_RETRIES 16
+
+#endif
+
 /*
  * in mm/vmscan.c:
+ *
+ * struct scan_control is private to vmscan.c. Out-of-tree LRU
+ * experiments (mm/lru_marie) read/update individual fields via the
+ * sc_* accessors declared below; the struct itself is opaque to
+ * everything outside vmscan.c.
  */
+struct scan_control;
+
 bool folio_isolate_lru(struct folio *folio);
 void folio_putback_lru(struct folio *folio);
+struct reclaim_stat;
+unsigned int shrink_folio_list(struct list_head *folio_list,
+		struct pglist_data *pgdat, struct scan_control *sc,
+		struct reclaim_stat *stat, bool ignore_references,
+		struct mem_cgroup *memcg);
 extern void reclaim_throttle(pg_data_t *pgdat, enum vmscan_throttle_state reason);
+int vmscan_reclaimer_offset(struct scan_control *sc);
+bool vmscan_can_reclaim_anon_pages(struct mem_cgroup *memcg, int nid,
+				   struct scan_control *sc);
+
+/*
+ * in mm/page_isolation.c -- "does this pageblock hold anything migration
+ * cannot move". Used by memory isolation and by mm/lru_marie's defrag to
+ * reject source blocks that evacuation could never free. Inexact by design;
+ * see the comment at the definition.
+ */
+struct page *has_unmovable_pages(unsigned long start_pfn, unsigned long end_pfn,
+				 enum pb_isolate_mode mode);
+
+/*
+ * scan_control accessors -- read/update the few fields out-of-tree
+ * readers need without exposing the struct layout. All defined in
+ * vmscan.c next to the struct definition; trivial enough that the
+ * compiler routinely inlines the body across LTO. Non-LTO builds
+ * pay one extra call per use, which lands only on cold paths
+ * (entry of marie_state_shrink_lruvec and the inner tier loop).
+ */
+int  sc_priority(const struct scan_control *sc);
+int  sc_reclaim_idx(const struct scan_control *sc);
+bool sc_reclaim_target_reached(const struct scan_control *sc);
+unsigned long sc_nr_to_reclaim(const struct scan_control *sc);
+unsigned long sc_nr_reclaimed(const struct scan_control *sc);
+void sc_add_reclaimed(struct scan_control *sc, unsigned long nr);
+gfp_t sc_gfp_mask(const struct scan_control *sc);
+bool sc_cgroup_reclaim(const struct scan_control *sc);
 int user_proactive_reclaim(char *buf,
 			   struct mem_cgroup *memcg, pg_data_t *pgdat);
 
@@ -594,6 +650,30 @@ struct alloc_context {
 	 */
 	enum zone_type highest_zoneidx;
 	bool spread_dirty_pages;
+
+#ifdef CONFIG_LRU_MARIE
+	/*
+	 * Snapshot of nr_swap_write_failed at the entry to
+	 * __alloc_pages_slowpath. should_reclaim_retry takes the delta to
+	 * decide whether the swap backend has rejected enough writes during
+	 * THIS allocation attempt to skip the rest of the reclaim retry
+	 * budget and OOM directly. See include/linux/swap.h for the
+	 * counter's contract. Marie-only; omitted under CONFIG_LRU_MARIE=n.
+	 */
+	long initial_swap_write_failed;
+#endif
+
+	/*
+	 * Snapshot of the global workingset refault counters (anon + file) at
+	 * the previous should_reclaim_retry check for this allocation.
+	 * should_reclaim_retry takes the delta to tell real reclaim progress
+	 * from a thrash treadmill: when the pages reclaimed during a retry
+	 * loop are dwarfed by working-set refaults over the same window, the
+	 * "progress" is other tasks' working sets being pulled straight back
+	 * in, and must not keep resetting no_progress_loops (else a RAM-backed
+	 * swap device that never looks full livelocks the OOM path forever).
+	 */
+	unsigned long last_refaults;
 };
 
 /*

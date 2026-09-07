@@ -24,6 +24,7 @@
 #include <linux/page_owner.h>
 #include <linux/psi.h>
 #include <linux/cpuset.h>
+#include <linux/lru_marie.h>
 #include "internal.h"
 
 #ifdef CONFIG_COMPACTION
@@ -3084,6 +3085,23 @@ static void kcompactd_do_work(pg_data_t *pgdat)
 							cc.highest_zoneidx);
 	count_compact_event(KCOMPACTD_WAKE);
 
+#ifdef CONFIG_LRU_MARIE_DEFRAG
+	/*
+	 * lru_marie/defrag=1: Marie defrag REPLACES stock demand compaction.
+	 * Demand is urgent (a high-order allocation is blocked), so Marie runs
+	 * with may_drop=true -- MOVE + DROP cold-dead clean file, its cheapest
+	 * and highest-value rung (the clean_min_ratio floor still bounds DROP).
+	 * Skip the stock two-scanner sweep entirely and mark the request
+	 * satisfied. defrag=0 / CONFIG off: the stock sweep below runs.
+	 */
+	if (lru_marie_defrag_active()) {
+		lru_marie_defrag_pgdat(pgdat, true);
+		pgdat->kcompactd_max_order = 0;
+		pgdat->kcompactd_highest_zoneidx = pgdat->nr_zones - 1;
+		return;
+	}
+#endif
+
 	for (zoneid = 0; zoneid <= cc.highest_zoneidx; zoneid++) {
 		int status;
 
@@ -3220,7 +3238,19 @@ static int kcompactd(void *p)
 			unsigned int prev_score, score;
 
 			prev_score = fragmentation_score_node(pgdat);
-			compact_node(pgdat, true);
+#ifdef CONFIG_LRU_MARIE_DEFRAG
+			/*
+			 * lru_marie/defrag=1: Marie defrag REPLACES stock proactive
+			 * compaction here. Background (no allocation waiting), so
+			 * may_drop=false -- MOVE only, never sacrifice cache. The
+			 * score-progress defer below applies to Marie's result
+			 * identically. =0 (default) or CONFIG off: stock compact_node().
+			 */
+			if (lru_marie_defrag_active())
+				lru_marie_defrag_pgdat(pgdat, false);
+			else
+#endif
+				compact_node(pgdat, true);
 			score = fragmentation_score_node(pgdat);
 			/*
 			 * Defer proactive compaction if the fragmentation

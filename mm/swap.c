@@ -37,6 +37,7 @@
 #include <linux/page_idle.h>
 #include <linux/local_lock.h>
 #include <linux/buffer_head.h>
+#include <linux/lru_marie.h>
 
 #include "internal.h"
 
@@ -73,11 +74,39 @@ static DEFINE_PER_CPU(struct cpu_fbatches, cpu_fbatches) = {
 static void __page_cache_release(struct folio *folio, struct lruvec **lruvecp,
 		unsigned long *flagsp)
 {
-	if (folio_test_lru(folio)) {
-		folio_lruvec_relock_irqsave(folio, lruvecp, flagsp);
-		lruvec_del_folio(*lruvecp, folio);
-		__folio_clear_lru_flags(folio);
+	/*
+	 * PG_lru is the "on an LRU list, still holding +nr LRU accounting"
+	 * signal. A folio that Marie's reclaim isolate already claimed has
+	 * PG_lru clear and its Marie counters already wound down
+	 * (marie_account_evict_isolate); only its per-PFN TRACKED byte stays
+	 * set, until the buddy handoff (marie_state_drop_pfn_at_free). Gating
+	 * the Marie del path on PG_lru -- not TRACKED alone -- keeps such an
+	 * isolated folio from being evict-accounted a SECOND time here: that
+	 * double count (a TRACKED-only gate over-firing on the isolate path)
+	 * drove marie_nr_folios and the per-mlv scan counters negative, which
+	 * in turn fed a runaway reclaim scan. Legacy del is already
+	 * PG_lru-gated, so an off-LRU folio was always a no-op here anyway.
+	 *
+	 * For an on-LRU folio, TRACKED then selects Marie del over legacy
+	 * del. Both debit mz->lru_zone_size now (marie_update_lru_size is
+	 * unified with legacy update_lru_size), so the choice is about the
+	 * LIST, not the count: a TRACKED folio sits on a Marie self-loop, so
+	 * legacy lruvec_del_folio's list_del would corrupt it -- it must go
+	 * through lru_marie_release_folio, which unlinks the self-loop and
+	 * debits mz. See lru_marie_release_folio's contract in
+	 * <linux/lru_marie.h>.
+	 */
+	if (!folio_test_lru(folio))
+		return;
+#ifdef CONFIG_LRU_MARIE
+	if (lru_marie_enabled() && lru_marie_test_tracked(folio)) {
+		lru_marie_release_folio(folio, lruvecp, flagsp);
+		return;
 	}
+#endif
+	folio_lruvec_relock_irqsave(folio, lruvecp, flagsp);
+	lruvec_del_folio(*lruvecp, folio);
+	__folio_clear_lru_flags(folio);
 }
 
 /*
@@ -171,6 +200,27 @@ static void folio_batch_move_lru(struct folio_batch *fbatch, move_fn_t move_fn)
 		folio_lruvec_relock_irqsave(folio, &lruvec, &flags);
 		move_fn(lruvec, folio);
 
+#ifdef CONFIG_LRU_MARIE
+		/*
+		 * lru_add's move_fn routes through lruvec_add_folio ->
+		 * lru_marie_add_folio, which (on success) installs the folio
+		 * into Marie and sets PG_lru itself. Marie's reclaim isolate
+		 * path claims folios with a lock-free folio_test_clear_lru and
+		 * does NOT hold lru_lock, so it can clear PG_lru in the window
+		 * between the install above and this trailing folio_set_lru.
+		 * Re-setting PG_lru here would then stamp PG_lru back onto a
+		 * folio the isolate path already owns and is about to free,
+		 * tripping "Bad page state |lru|" at free_unref_folios. When
+		 * the folio is Marie-tracked, install already published PG_lru;
+		 * skip the redundant (and racy) re-set. The non-lru_add move_fns
+		 * (rotate/activate/deactivate/lazyfree) are gated away from
+		 * Marie folios at their swap.c entry points, so they never
+		 * reach here for a tracked folio.
+		 */
+		if (lru_marie_enabled() && lru_marie_test_tracked(folio))
+			continue;
+#endif
+
 		folio_set_lru(folio);
 	}
 
@@ -215,6 +265,44 @@ static void lru_move_tail(struct lruvec *lruvec, struct folio *folio)
 	if (folio_test_unevictable(folio))
 		return;
 
+#ifdef CONFIG_LRU_MARIE
+	/*
+	 * This rotate-batch move_fn can run in hardirq: the lru_move_tail
+	 * batch is flushed from folio_end_writeback() in the block-completion
+	 * IRQ (e.g. nvme_irq -> blk_mq_end_request_batch). Marie's
+	 * lruvec_del_folio / lruvec_add_folio_tail hooks must not run there:
+	 * they assert !in_hardirq(), and lru_marie_add_folio() would ADOPT the
+	 * folio into Marie (which never credits mz->lru_zone_size) right after
+	 * the legacy del already did mz -nr, underflowing mz->lru_zone_size.
+	 *
+	 * Under Marie, handle the rotate without those hooks:
+	 *   - a tracked folio does not sit on the legacy list and ages by gen
+	 *     rotation, so rotate-to-tail is a no-op -- skip it;
+	 *   - a non-tracked folio is on the legacy lruvec list (mz-accounted),
+	 *     so rotate it with pure legacy list ops (this mirrors
+	 *     lruvec_del_folio + lruvec_add_folio_tail for an evictable,
+	 *     non-tracked folio, minus the Marie/lru_gen hooks).
+	 */
+	if (lru_marie_enabled()) {
+		long nr_pages = folio_nr_pages(folio);
+		int zid = folio_zonenum(folio);
+		enum lru_list lru;
+
+		if (lru_marie_test_tracked(folio))
+			return;
+
+		lru = folio_lru_list(folio);
+		list_del(&folio->lru);
+		update_lru_size(lruvec, lru, zid, -nr_pages);
+		folio_clear_active(folio);
+		lru = folio_lru_list(folio);
+		update_lru_size(lruvec, lru, zid, nr_pages);
+		list_add_tail(&folio->lru, &lruvec->lists[lru]);
+		__count_vm_events(PGROTATED, nr_pages);
+		return;
+	}
+#endif
+
 	lruvec_del_folio(lruvec, folio);
 	folio_clear_active(folio);
 	lruvec_add_folio_tail(lruvec, folio);
@@ -233,6 +321,14 @@ void folio_rotate_reclaimable(struct folio *folio)
 	if (folio_test_locked(folio) || folio_test_dirty(folio) ||
 	    folio_test_unevictable(folio) || !folio_test_lru(folio))
 		return;
+
+#ifdef CONFIG_LRU_MARIE
+	/* Marie folios bypass legacy LRU lists; apply the rotate on the
+	 * per-PFN state (demote toward prompt reclaim) instead of queueing
+	 * the legacy lru_move_tail batch. See lru_marie_rotate(). */
+	if (lru_marie_rotate(folio))
+		return;
+#endif
 
 	folio_batch_add_and_move(folio, lru_move_tail);
 }
@@ -300,6 +396,12 @@ void lru_note_cost_refault(struct folio *folio)
 				folio_nr_pages(folio), 0);
 }
 
+/*
+ * lru_marie_orphan_add() (the non-adopting legacy add for untracked orphans
+ * inside a del+add move_fn) lives in mm/lru_marie/core.c so vmscan.c's reclaim
+ * putback can share it; declared in <linux/lru_marie.h>.
+ */
+
 static void lru_activate(struct lruvec *lruvec, struct folio *folio)
 {
 	long nr_pages = folio_nr_pages(folio);
@@ -307,10 +409,24 @@ static void lru_activate(struct lruvec *lruvec, struct folio *folio)
 	if (folio_test_active(folio) || folio_test_unevictable(folio))
 		return;
 
+#ifdef CONFIG_LRU_MARIE
+	/*
+	 * Tracked Marie folios are never on legacy lists (the swap.c entry
+	 * gates divert them); guard defensively, and route the untracked
+	 * orphan's re-add away from lru_marie_add_folio()'s adopt path.
+	 */
+	if (lru_marie_enabled() && lru_marie_test_tracked(folio))
+		return;
+#endif
 
 	lruvec_del_folio(lruvec, folio);
 	folio_set_active(folio);
-	lruvec_add_folio(lruvec, folio);
+#ifdef CONFIG_LRU_MARIE
+	if (lru_marie_enabled())
+		lru_marie_orphan_add(lruvec, folio, false);
+	else
+#endif
+		lruvec_add_folio(lruvec, folio);
 	trace_mm_lru_activate(folio);
 
 	__count_vm_events(PGACTIVATE, nr_pages);
@@ -332,6 +448,13 @@ void folio_activate(struct folio *folio)
 	    !folio_test_lru(folio))
 		return;
 
+#ifdef CONFIG_LRU_MARIE
+	/* Marie folios bypass legacy LRU lists; apply the promote on the
+	 * per-PFN state instead of queueing the legacy lru_activate batch. */
+	if (lru_marie_activate(folio))
+		return;
+#endif
+
 	folio_batch_add_and_move(folio, lru_activate);
 }
 
@@ -346,6 +469,15 @@ void folio_activate(struct folio *folio)
 
 	if (!folio_test_clear_lru(folio))
 		return;
+
+#ifdef CONFIG_LRU_MARIE
+	/* Re-publish the PG_lru this path speculatively cleared above; the
+	 * promote happened on the per-PFN state in lru_marie_activate(). */
+	if (lru_marie_activate(folio)) {
+		folio_set_lru(folio);
+		return;
+	}
+#endif
 
 	lruvec = folio_lruvec_lock_irq(folio);
 	lru_activate(lruvec, folio);
@@ -460,6 +592,46 @@ void folio_mark_accessed(struct folio *folio)
 		lru_gen_inc_refs(folio);
 		return;
 	}
+#ifdef CONFIG_LRU_MARIE
+	/*
+	 * Marie: the same two-strike ladder as the legacy path below, with
+	 * "promote to the head gen" standing in for "move to the active list".
+	 *
+	 * This hook used to return here without recording anything, because
+	 * the only place Marie had to record an access was the per-PFN tier,
+	 * and tier had no decay: it only ever rose, and survivor re-publish
+	 * preserved it. Feeding it from a hook that fires on essentially every
+	 * read / pagecache hit / fault (filemap_read, __filemap_get_folio,
+	 * shmem, gup, ...) pinned folios at hot_votes >= 1 in
+	 * folio_check_references (permanent KEEP), starving reclaim into an
+	 * OOM with swap still free. Tier is retired (state.h's byte-layout
+	 * block), and the two signals used here in its place both decay:
+	 *
+	 *   - PG_referenced is cleared by the second access itself (inside
+	 *     lru_marie_mark_accessed) and by folio_check_references' own
+	 *     folio_test_clear_referenced, so it cannot accumulate;
+	 *   - the head-gen promotion is idempotent -- marie_state_move_to_gen
+	 *     returns immediately when the byte already names the head gen, so
+	 *     a folio moves at most once per head advance (every
+	 *     marie_gen_growth_live[type] installs), not once per access.
+	 *
+	 * Without this, unmapped pagecache carries NO access signal at all
+	 * under Marie: the walker cannot see it (nothing is mapped, so there
+	 * are no young PTEs), and folio_check_references sees referenced_ptes
+	 * == 0 with PG_referenced never set by anyone. Measured on 6.12.74:
+	 * pgsteal_file/pgscan_file == 1.0000, i.e. every scanned file folio
+	 * reclaimed, however often it had just been read.
+	 */
+	if (lru_marie_enabled()) {
+		if (!folio_test_referenced(folio))
+			folio_set_referenced(folio);
+		else if (!folio_test_unevictable(folio))
+			lru_marie_mark_accessed(folio);
+		if (folio_test_idle(folio))
+			folio_clear_idle(folio);
+		return;
+	}
+#endif
 
 	if (!folio_test_referenced(folio)) {
 		folio_set_referenced(folio);
@@ -504,9 +676,24 @@ void folio_add_lru(struct folio *folio)
 	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
 
 	/* see the comment in lru_gen_folio_seq() */
+#ifdef CONFIG_LRU_MARIE
+	/*
+	 * Marie bypass: Marie tracks folios via per-PFN state bytes,
+	 * not on legacy/MGLRU lists, and does not use PG_active. If
+	 * we set it here, the folio enters Marie with PG_active=1;
+	 * later marie_state_shrink_lruvec -> shrink_folio_list trips
+	 * VM_BUG_ON_FOLIO(folio_test_active(folio), folio) in
+	 * mm/vmscan.c. Skip the MGLRU fault hint when Marie owns
+	 * the LRU. (See also defensive clear in lru_marie_add_folio.)
+	 */
+	if (!lru_marie_enabled() && lru_gen_enabled() && !folio_test_unevictable(folio) &&
+	    lru_gen_in_fault() && !(current->flags & PF_MEMALLOC))
+		folio_set_active(folio);
+#else
 	if (lru_gen_enabled() && !folio_test_unevictable(folio) &&
 	    lru_gen_in_fault() && !(current->flags & PF_MEMALLOC))
 		folio_set_active(folio);
+#endif
 
 	folio_batch_add_and_move(folio, lru_add);
 }
@@ -563,6 +750,11 @@ static void lru_deactivate_file(struct lruvec *lruvec, struct folio *folio)
 	if (folio_mapped(folio))
 		return;
 
+#ifdef CONFIG_LRU_MARIE
+	if (lru_marie_enabled() && lru_marie_test_tracked(folio))
+		return;
+#endif
+
 	lruvec_del_folio(lruvec, folio);
 	folio_clear_active(folio);
 	folio_clear_referenced(folio);
@@ -574,14 +766,24 @@ static void lru_deactivate_file(struct lruvec *lruvec, struct folio *folio)
 		 * race window is _really_ small and  it's not a critical
 		 * problem.
 		 */
-		lruvec_add_folio(lruvec, folio);
+#ifdef CONFIG_LRU_MARIE
+		if (lru_marie_enabled())
+			lru_marie_orphan_add(lruvec, folio, false);
+		else
+#endif
+			lruvec_add_folio(lruvec, folio);
 		folio_set_reclaim(folio);
 	} else {
 		/*
 		 * The folio's writeback ended while it was in the batch.
 		 * We move that folio to the tail of the inactive list.
 		 */
-		lruvec_add_folio_tail(lruvec, folio);
+#ifdef CONFIG_LRU_MARIE
+		if (lru_marie_enabled())
+			lru_marie_orphan_add(lruvec, folio, true);
+		else
+#endif
+			lruvec_add_folio_tail(lruvec, folio);
 		__count_vm_events(PGROTATED, nr_pages);
 	}
 
@@ -599,10 +801,20 @@ static void lru_deactivate(struct lruvec *lruvec, struct folio *folio)
 	if (folio_test_unevictable(folio) || !(folio_test_active(folio) || lru_gen_enabled()))
 		return;
 
+#ifdef CONFIG_LRU_MARIE
+	if (lru_marie_enabled() && lru_marie_test_tracked(folio))
+		return;
+#endif
+
 	lruvec_del_folio(lruvec, folio);
 	folio_clear_active(folio);
 	folio_clear_referenced(folio);
-	lruvec_add_folio(lruvec, folio);
+#ifdef CONFIG_LRU_MARIE
+	if (lru_marie_enabled())
+		lru_marie_orphan_add(lruvec, folio, false);
+	else
+#endif
+		lruvec_add_folio(lruvec, folio);
 
 	__count_vm_events(PGDEACTIVATE, nr_pages);
 	count_memcg_events(lruvec_memcg(lruvec), PGDEACTIVATE, nr_pages);
@@ -616,6 +828,11 @@ static void lru_lazyfree(struct lruvec *lruvec, struct folio *folio)
 	    folio_test_swapcache(folio) || folio_test_unevictable(folio))
 		return;
 
+#ifdef CONFIG_LRU_MARIE
+	if (lru_marie_enabled() && lru_marie_test_tracked(folio))
+		return;
+#endif
+
 	lruvec_del_folio(lruvec, folio);
 	folio_clear_active(folio);
 	if (lru_gen_enabled())
@@ -628,7 +845,12 @@ static void lru_lazyfree(struct lruvec *lruvec, struct folio *folio)
 	 * anonymous folios
 	 */
 	folio_clear_swapbacked(folio);
-	lruvec_add_folio(lruvec, folio);
+#ifdef CONFIG_LRU_MARIE
+	if (lru_marie_enabled())
+		lru_marie_orphan_add(lruvec, folio, false);
+	else
+#endif
+		lruvec_add_folio(lruvec, folio);
 
 	__count_vm_events(PGLAZYFREE, nr_pages);
 	count_memcg_events(lruvec_memcg(lruvec), PGLAZYFREE, nr_pages);
@@ -692,6 +914,13 @@ void deactivate_file_folio(struct folio *folio)
 	if (lru_gen_enabled() && lru_gen_clear_refs(folio))
 		return;
 
+#ifdef CONFIG_LRU_MARIE
+	/* Marie folios bypass legacy LRU lists; apply the demote on the
+	 * per-PFN state instead of queueing the legacy batch. */
+	if (lru_marie_deactivate(folio))
+		return;
+#endif
+
 	folio_batch_add_and_move(folio, lru_deactivate_file);
 }
 
@@ -711,6 +940,13 @@ void folio_deactivate(struct folio *folio)
 	if (lru_gen_enabled() ? lru_gen_clear_refs(folio) : !folio_test_active(folio))
 		return;
 
+#ifdef CONFIG_LRU_MARIE
+	/* Marie folios bypass legacy LRU lists; apply the demote on the
+	 * per-PFN state instead of queueing the legacy batch. */
+	if (lru_marie_deactivate(folio))
+		return;
+#endif
+
 	folio_batch_add_and_move(folio, lru_deactivate);
 }
 
@@ -727,6 +963,14 @@ void folio_mark_lazyfree(struct folio *folio)
 	    !folio_test_lru(folio) ||
 	    folio_test_swapcache(folio) || folio_test_unevictable(folio))
 		return;
+
+#ifdef CONFIG_LRU_MARIE
+	/* Marie folios bypass legacy LRU lists; lru_marie_lazyfree() clears
+	 * PG_swapbacked synchronously (MADV_FREE: free-without-writeback) and
+	 * demotes on the per-PFN state instead of queueing the legacy batch. */
+	if (lru_marie_lazyfree(folio))
+		return;
+#endif
 
 	folio_batch_add_and_move(folio, lru_lazyfree);
 }

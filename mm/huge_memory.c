@@ -6,6 +6,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/mm.h>
+#include <linux/lru_marie.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/numa_balancing.h>
@@ -3258,14 +3259,48 @@ static void lru_add_split_folio(struct folio *folio, struct folio *new_folio,
 		/* page reclaim is reclaiming a huge page */
 		VM_WARN_ON(folio_test_lru(folio));
 		folio_get(new_folio);
+#ifdef CONFIG_LRU_MARIE
+		/*
+		 * Reclaim-split of a Marie-owned THP: register the tail with
+		 * Marie (TRACKED) just like the on-LRU split below, so it never
+		 * becomes a ¬TRACKED folio that a later putback re-stamps PG_lru
+		 * onto -- an escapee whose legacy del underflows mz->lru_zone_size
+		 * and corrupts memory. The tail goes on the reclaim @list off-LRU
+		 * (no PG_lru), exactly like its isolated head; Marie's
+		 * reclaim/putback then accounts it. No-op when @folio is untracked.
+		 */
+		if (lru_marie_enabled())
+			lru_marie_split_folio_isolated(folio, new_folio);
+#endif
 		list_add_tail(&new_folio->lru, list);
 	} else {
 		/* head is still on lru (and we have it frozen) */
 		VM_WARN_ON(!folio_test_lru(folio));
-		if (folio_test_unevictable(folio))
+		if (folio_test_unevictable(folio)) {
 			new_folio->mlock_count = 0;
-		else
+		} else {
+#ifdef CONFIG_LRU_MARIE
+			/*
+			 * If Marie owns @folio (the head), the legacy
+			 * list_add_tail below would put the new tail on the
+			 * legacy LRU without a TRACKED state byte, leaving it
+			 * invisible to Marie's per-PFN bookkeeping (the TRACKED
+			 * state byte + marie_nr_folios). Route through Marie's
+			 * split helper which sets TRACKED,
+			 * publishes the per-PFN state at the same gen as
+			 * @folio, and increments the folio counter. The
+			 * helper falls back to plain list_add_tail when
+			 * @folio is not Marie-tracked, so the static branch
+			 * is the only gate the !lru_marie_enabled() case sees.
+			 */
+			if (lru_marie_enabled())
+				lru_marie_split_folio(lruvec, folio, new_folio);
+			else
+				list_add_tail(&new_folio->lru, &folio->lru);
+#else
 			list_add_tail(&new_folio->lru, &folio->lru);
+#endif
+		}
 		folio_set_lru(new_folio);
 	}
 }

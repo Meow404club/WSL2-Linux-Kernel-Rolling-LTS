@@ -5,6 +5,7 @@
 #include <linux/atomic.h>
 #include <linux/huge_mm.h>
 #include <linux/mm_types.h>
+#include <linux/lru_marie.h>
 #include <linux/swap.h>
 #include <linux/string.h>
 #include <linux/userfaultfd_k.h>
@@ -41,7 +42,22 @@ static __always_inline void __update_lru_size(struct lruvec *lruvec,
 {
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 
+	/*
+	 * Marie's reclaim isolate path (marie_evict_counters_only) and
+	 * deferred post-reclaim teardown (marie_state_drop_pfn_after_reclaim
+	 * via marie_state_shrink_lruvec) intentionally run this without
+	 * lru_lock: install/evict serialise via marie_state[pfn]'s TRACKED
+	 * bit and folio_test_clear_lru, and the per-CPU vmstat helpers
+	 * called below are preempt-off-safe on their own. Skip the lockdep
+	 * assertion in that mode. Legacy / MGLRU paths still get full
+	 * coverage when lru_marie_enabled() is false.
+	 */
+#ifdef CONFIG_LRU_MARIE
+	if (!lru_marie_enabled())
+		lockdep_assert_held(&lruvec->lru_lock);
+#else
 	lockdep_assert_held(&lruvec->lru_lock);
+#endif
 	WARN_ON_ONCE(nr_pages != (int)nr_pages);
 
 	__mod_lruvec_state(lruvec, NR_LRU_BASE + lru, nr_pages);
@@ -103,14 +119,14 @@ static __always_inline enum lru_list folio_lru_list(const struct folio *folio)
 #ifdef CONFIG_LRU_GEN
 
 #ifdef CONFIG_LRU_GEN_ENABLED
-static inline bool lru_gen_enabled(void)
+static inline bool lru_gen_core_enabled(void)
 {
 	DECLARE_STATIC_KEY_TRUE(lru_gen_caps[NR_LRU_GEN_CAPS]);
 
 	return static_branch_likely(&lru_gen_caps[LRU_GEN_CORE]);
 }
 #else
-static inline bool lru_gen_enabled(void)
+static inline bool lru_gen_core_enabled(void)
 {
 	DECLARE_STATIC_KEY_FALSE(lru_gen_caps[NR_LRU_GEN_CAPS]);
 
@@ -118,10 +134,56 @@ static inline bool lru_gen_enabled(void)
 }
 #endif
 
+/*
+ * lru_gen_core_enabled() reports the raw MGLRU core static key. Almost no
+ * caller wants that directly -- they want lru_gen_enabled() below, which is
+ * additionally masked off whenever Marie is the active LRU manager.
+ *
+ * Marie and MGLRU are mutually exclusive at runtime. When Marie owns aging,
+ * every MGLRU code path must be inert: folio_mark_accessed() ->
+ * lru_gen_inc_refs(), the reclaim/aging dispatch, workingset refault, the
+ * rmap look-around, and so on. Reporting MGLRU as disabled here makes "both
+ * managers touch the same folio" structurally unrepresentable for every
+ * lru_gen_enabled() reader, so an MGLRU writer that forgets a
+ * !lru_marie_enabled() guard can no longer stamp LRU_GEN / LRU_REFS state
+ * onto a Marie-owned folio -- residue that would otherwise leak into
+ * PAGE_FLAGS_CHECK_AT_FREE (LRU_GEN_MASK) at the buddy handoff.
+ *
+ * The Marie<->MGLRU ownership selection (decided once at boot) must still
+ * observe the real key; it calls lru_gen_core_enabled() directly.
+ */
+static inline bool lru_gen_enabled(void)
+{
+#ifdef CONFIG_LRU_MARIE
+	if (lru_marie_enabled())
+		return false;
+#endif
+	return lru_gen_core_enabled();
+}
+
 static inline bool lru_gen_in_fault(void)
 {
 	return current->in_lru_fault;
 }
+
+/*
+ * Move lruvec contents between legacy lruvec->lists[lru] and
+ * lrugen->folios[gen][type][zone] using MGLRU's canonical add/del
+ * helpers. Exported for external LRU drivers (mm/lru_marie) that
+ * need to keep MGLRU's state_is_valid invariant intact across their
+ * own enable/disable transitions.
+ *
+ *   lru_gen_fill_lruvec  -- legacy lists  -> lrugen (MGLRU's normal
+ *                            enable-time fill, made callable)
+ *   lru_gen_drain_lruvec -- lrugen        -> lruvec_add_folio path
+ *                            (when another driver's gate is on the
+ *                            folios route into that driver directly)
+ *
+ * Caller holds lruvec->lru_lock irqsave; helper releases+reacquires
+ * across cond_resched.
+ */
+void lru_gen_fill_lruvec(struct lruvec *lruvec);
+void lru_gen_drain_lruvec(struct lruvec *lruvec);
 
 static inline int lru_gen_from_seq(unsigned long seq)
 {
@@ -311,10 +373,18 @@ static inline void folio_migrate_refs(struct folio *new, const struct folio *old
 }
 #else /* !CONFIG_LRU_GEN */
 
+static inline bool lru_gen_core_enabled(void)
+{
+	return false;
+}
+
 static inline bool lru_gen_enabled(void)
 {
 	return false;
 }
+
+static inline void lru_gen_fill_lruvec(struct lruvec *lruvec) { }
+static inline void lru_gen_drain_lruvec(struct lruvec *lruvec) { }
 
 static inline bool lru_gen_in_fault(void)
 {
@@ -342,8 +412,23 @@ void lruvec_add_folio(struct lruvec *lruvec, struct folio *folio)
 {
 	enum lru_list lru = folio_lru_list(folio);
 
+#ifdef CONFIG_LRU_MARIE
+	if (lru_marie_add_folio(lruvec, folio, false))
+		return;
+
+	/*
+	 * If Marie is enabled, lru_marie_add_folio failed only due to allocation
+	 * exhaustion (slab + mempool reserve both depleted).  Skip MGLRU
+	 * and fall directly to the legacy LRU lists: shrink_lruvec runs
+	 * legacy reclaim alongside Marie specifically to drain these
+	 * orphans, but MGLRU is bypassed entirely when lru_marie_enabled().
+	 */
+	if (!lru_marie_enabled() && lru_gen_add_folio(lruvec, folio, false))
+		return;
+#else
 	if (lru_gen_add_folio(lruvec, folio, false))
 		return;
+#endif
 
 	update_lru_size(lruvec, lru, folio_zonenum(folio),
 			folio_nr_pages(folio));
@@ -356,8 +441,17 @@ void lruvec_add_folio_tail(struct lruvec *lruvec, struct folio *folio)
 {
 	enum lru_list lru = folio_lru_list(folio);
 
+#ifdef CONFIG_LRU_MARIE
+	if (lru_marie_add_folio(lruvec, folio, true))
+		return;
+
+	/* See lruvec_add_folio() — Marie alloc failure falls to legacy, not MGLRU. */
+	if (!lru_marie_enabled() && lru_gen_add_folio(lruvec, folio, true))
+		return;
+#else
 	if (lru_gen_add_folio(lruvec, folio, true))
 		return;
+#endif
 
 	update_lru_size(lruvec, lru, folio_zonenum(folio),
 			folio_nr_pages(folio));
@@ -369,6 +463,11 @@ static __always_inline
 void lruvec_del_folio(struct lruvec *lruvec, struct folio *folio)
 {
 	enum lru_list lru = folio_lru_list(folio);
+
+#ifdef CONFIG_LRU_MARIE
+	if (lru_marie_del_folio(lruvec, folio, false))
+		return;
+#endif
 
 	if (lru_gen_del_folio(lruvec, folio, false))
 		return;

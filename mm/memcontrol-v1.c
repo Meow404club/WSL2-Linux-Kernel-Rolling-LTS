@@ -11,6 +11,7 @@
 #include <linux/sort.h>
 #include <linux/file.h>
 #include <linux/seq_buf.h>
+#include <linux/lru_marie.h>
 
 #include "internal.h"
 #include "swap.h"
@@ -1961,6 +1962,16 @@ static int mem_cgroup_swappiness_write(struct cgroup_subsys_state *css,
 		WRITE_ONCE(memcg->swappiness, val);
 	} else
 		WRITE_ONCE(vm_swappiness, val);
+
+#ifdef CONFIG_LRU_MARIE
+	/*
+	 * Notify Marie so its global swap_bias controller resets to neutral
+	 * under the new value. Desktop/global-only: a single node-wide
+	 * atomic64, so the reset is one atomic64_set, not scoped to @memcg.
+	 * See lru_marie.h.
+	 */
+	lru_marie_swappiness_changed();
+#endif
 
 	return 0;
 }

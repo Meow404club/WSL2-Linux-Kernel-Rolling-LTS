@@ -366,6 +366,30 @@ enum objext_flags {
 
 #define OBJEXTS_FLAGS_MASK (__NR_OBJEXTS_FLAGS - 1)
 
+/*
+ * Declared outside the CONFIG_MEMCG branches on purpose: the definition in
+ * mm/lru_marie/core.c is unconditional under CONFIG_LRU_MARIE, and x86_64
+ * defconfig builds with CONFIG_MEMCG=n (-Wmissing-prototypes otherwise).
+ */
+#ifdef CONFIG_LRU_MARIE
+/*
+ * Out-of-line (lru_marie_enabled()'s static key lives in lru_marie.h, which
+ * memcontrol.h must not pull in). Implements the single-source SWITCH for the
+ * reader:
+ *   - Marie enabled + evictable lru -> the Marie/global size (the node
+ *     NR_ZONE_LRU_BASE vmstat total) is the SOLE truth (contract: every
+ *     evictable folio is Marie-tracked, so stock holds nothing for these
+ *     buckets).
+ *   - otherwise (Marie disabled, or LRU_UNEVICTABLE which Marie never tracks)
+ *     -> the @stock value passed in.
+ * NOT a sum: summing made stock a second, drift-prone source whose boundary
+ * leaks underflowed mem_cgroup_update_lru_size. @stock is passed so the
+ * common !CONFIG / disabled path keeps the plain stock read.
+ */
+unsigned long lru_marie_zone_size_read(struct lruvec *lruvec, enum lru_list lru,
+				       int zone_idx, unsigned long stock);
+#endif
+
 #ifdef CONFIG_MEMCG
 
 static inline bool folio_memcg_kmem(struct folio *folio);
@@ -903,9 +927,14 @@ unsigned long mem_cgroup_get_zone_lru_size(struct lruvec *lruvec,
 		enum lru_list lru, int zone_idx)
 {
 	struct mem_cgroup_per_node *mz;
+	unsigned long size;
 
 	mz = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
-	return READ_ONCE(mz->lru_zone_size[zone_idx][lru]);
+	size = READ_ONCE(mz->lru_zone_size[zone_idx][lru]);
+#ifdef CONFIG_LRU_MARIE
+	size = lru_marie_zone_size_read(lruvec, lru, zone_idx, size);
+#endif
+	return size;
 }
 
 void __mem_cgroup_handle_over_high(gfp_t gfp_mask);

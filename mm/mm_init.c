@@ -1423,6 +1423,9 @@ static void __meminit pgdat_init_internals(struct pglist_data *pgdat)
 	pgdat_init_kcompactd(pgdat);
 
 	init_waitqueue_head(&pgdat->kswapd_wait);
+#if defined(CONFIG_LRU_MARIE) && defined(CONFIG_SWAP)
+	init_waitqueue_head(&pgdat->kcompressd_wait);
+#endif
 	init_waitqueue_head(&pgdat->pfmemalloc_wait);
 
 	for (i = 0; i < NR_VMSCAN_THROTTLE; i++)

@@ -75,6 +75,7 @@
 #include <linux/userfaultfd_k.h>
 #include <linux/mm_inline.h>
 #include <linux/oom.h>
+#include <linux/lru_marie.h>
 
 #include <asm/tlb.h>
 
@@ -897,6 +898,11 @@ static bool folio_referenced_one(struct folio *folio,
 		if (lru_gen_enabled() && pvmw.pte) {
 			if (lru_gen_look_around(&pvmw))
 				referenced++;
+#ifdef CONFIG_LRU_MARIE
+		} else if (lru_marie_enabled() && pvmw.pte) {
+			if (lru_marie_look_around(&pvmw, pvmw.nr_pages))
+				referenced++;
+#endif
 		} else if (pvmw.pte) {
 			if (ptep_clear_flush_young_notify(vma, address,
 						pvmw.pte))

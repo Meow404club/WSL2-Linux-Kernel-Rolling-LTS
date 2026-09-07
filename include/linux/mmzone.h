@@ -23,6 +23,8 @@
 #include <linux/page-flags.h>
 #include <linux/local_lock.h>
 #include <linux/zswap.h>
+#include <linux/sizes.h>
+#include <linux/kfifo.h>
 #include <asm/page.h>
 
 /* Free memory management - zoned buddy allocator.  */
@@ -1441,6 +1443,20 @@ typedef struct pglist_data {
 	enum zone_type kswapd_highest_zoneidx;
 
 	atomic_t kswapd_failures;	/* Number of 'reclaimed == 0' runs */
+
+#if defined(CONFIG_LRU_MARIE) && defined(CONFIG_SWAP)
+/*
+ * kfifo backing storage capacity (in folio* slots). The sysfs knob
+ * vm_kcompressd sets the effective queue length in [-100, +100]; this
+ * matches the upper bound. ~800 bytes per pgdat regardless of the
+ * currently configured depth.
+ */
+#define KCOMPRESSD_FIFO_SIZE 100
+	wait_queue_head_t kcompressd_wait;
+	struct task_struct *kcompressd;
+	struct kfifo kcompressd_fifo;
+	spinlock_t kcompressd_fifo_lock;
+#endif
 
 #ifdef CONFIG_COMPACTION
 	int kcompactd_max_order;
