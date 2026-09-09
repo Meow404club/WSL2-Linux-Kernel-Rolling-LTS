@@ -6,6 +6,7 @@
 
 #include "vma_internal.h"
 #include "vma.h"
+#include <linux/ksm.h>
 
 struct mmap_state {
 	struct mm_struct *mm;
@@ -382,6 +383,7 @@ again:
 		mpol_put(vma_policy(vp->remove));
 		if (!vp->remove2)
 			WARN_ON_ONCE(vp->vma->vm_end < vp->remove->vm_end);
+		uksm_remove_vma(vp->remove, "vma_complete");
 		vm_area_free(vp->remove);
 
 		/*
@@ -460,6 +462,7 @@ void remove_vma(struct vm_area_struct *vma)
 	if (vma->vm_file)
 		fput(vma->vm_file);
 	mpol_put(vma_policy(vma));
+	uksm_remove_vma(vma, "remove vma");
 	vm_area_free(vma);
 }
 
@@ -552,6 +555,7 @@ __split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
 	if (is_vm_hugetlb_page(vma))
 		hugetlb_split(vma, addr);
 
+	uksm_remove_vma(vma, "__split_vma");
 	if (new_below) {
 		vma->vm_start = addr;
 		vma->vm_pgoff += (addr - new->vm_start) >> PAGE_SHIFT;
@@ -561,6 +565,8 @@ __split_vma(struct vma_iterator *vmi, struct vm_area_struct *vma,
 
 	/* vma_complete stores the new vma */
 	vma_complete(&vp, vmi, vma->vm_mm);
+	uksm_add_vma_new(vma, "__split_vma_1");
+	uksm_add_vma_new(new, "__split_vma_2");
 	validate_mm(vma->vm_mm);
 
 	/* Success. */
@@ -711,7 +717,9 @@ static void vmg_adjust_set_range(struct vma_merge_struct *vmg)
 		return;
 	}
 
+	uksm_remove_vma(adjust, "commit_merge_adjust");
 	vma_set_range(adjust, vmg->end, adjust->vm_end, pgoff);
+	uksm_add_vma_new(adjust, "commit_merge_adjust");
 }
 
 /*
@@ -755,9 +763,11 @@ static int commit_merge(struct vma_merge_struct *vmg)
 	 */
 	vma_adjust_trans_huge(vma, vmg->start, vmg->end,
 			      vmg->__adjust_middle_start ? vmg->middle : NULL);
+	uksm_remove_vma(vma, "vma_expand");
 	vma_set_range(vma, vmg->start, vmg->end, vmg->pgoff);
 	vmg_adjust_set_range(vmg);
 	vma_iter_store_overwrite(vmg->vmi, vmg->target);
+	uksm_add_vma_new(vma, "vma_expand");
 
 	vma_complete(&vp, vmg->vmi, vma->vm_mm);
 
@@ -1239,6 +1249,7 @@ int vma_shrink(struct vma_iterator *vmi, struct vm_area_struct *vma,
 	if (vma_iter_prealloc(vmi, NULL))
 		return -ENOMEM;
 
+	uksm_remove_vma(vma, "vma_shrink");
 	vma_start_write(vma);
 
 	init_vma_prep(&vp, vma);
@@ -1248,6 +1259,7 @@ int vma_shrink(struct vma_iterator *vmi, struct vm_area_struct *vma,
 	vma_iter_clear(vmi);
 	vma_set_range(vma, start, end, pgoff);
 	vma_complete(&vp, vmi, vma->vm_mm);
+	uksm_add_vma_new(vma, "vma_shrink");
 	validate_mm(vma->vm_mm);
 	return 0;
 }
@@ -1925,6 +1937,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 		if (vma_link(mm, new_vma))
 			goto out_vma_link;
 		*need_rmap_locks = false;
+		uksm_add_vma_new(new_vma, "copy_vma");
 	}
 	return new_vma;
 
@@ -2540,6 +2553,7 @@ static int __mmap_new_vma(struct mmap_state *map, struct vm_area_struct **vmap)
 	/* Lock the VMA since it is modified after insertion into VMA tree */
 	vma_start_write(vma);
 	vma_iter_store_new(vmi, vma);
+	uksm_add_vma_new(vma, "mmap_region");
 	map->mm->map_count++;
 	vma_link_file(vma);
 
@@ -2555,6 +2569,7 @@ static int __mmap_new_vma(struct mmap_state *map, struct vm_area_struct **vmap)
 free_iter_vma:
 	vma_iter_free(vmi);
 free_vma:
+	uksm_remove_vma(vma, "mmap_region");
 	vm_area_free(vma);
 	return error;
 }
@@ -2812,6 +2827,7 @@ int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
 	 * Note: This happens *after* clearing old mappings in some code paths.
 	 */
 	vm_flags |= VM_DATA_DEFAULT_FLAGS | VM_ACCOUNT | mm->def_flags;
+	uksm_vm_flags_mod(&vm_flags);
 	vm_flags = ksm_vma_flags(mm, NULL, vm_flags);
 	if (!may_expand_vm(mm, vm_flags, len >> PAGE_SHIFT))
 		return -ENOMEM;
@@ -2827,12 +2843,14 @@ int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
 	 * occur after forking, so the expand will only happen on new VMAs.
 	 */
 	if (vma && vma->vm_end == addr) {
+		uksm_remove_vma(vma, "do_brk_flags_1");
 		VMG_STATE(vmg, mm, vmi, addr, addr + len, vm_flags, PHYS_PFN(addr));
 
 		vmg.prev = vma;
 		/* vmi is positioned at prev, which this mode expects. */
 		vmg.just_expand = true;
 
+		uksm_add_vma_new(vma, "do_brk_flags_1");
 		if (vma_merge_new_range(&vmg))
 			goto out;
 		else if (vmg_nomem(&vmg))
@@ -2856,6 +2874,7 @@ int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *vma,
 
 	mm->map_count++;
 	validate_mm(mm);
+	uksm_add_vma_new(vma, "do_brk_flags_2");
 out:
 	perf_event_mmap(vma);
 	mm->total_vm += len >> PAGE_SHIFT;

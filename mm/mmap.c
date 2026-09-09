@@ -45,6 +45,7 @@
 #include <linux/moduleparam.h>
 #include <linux/pkeys.h>
 #include <linux/oom.h>
+#include <linux/ksm.h>
 #include <linux/sched/mm.h>
 #include <linux/ksm.h>
 #include <linux/memfd.h>
@@ -399,6 +400,8 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 	 */
 	vm_flags |= calc_vm_prot_bits(prot, pkey) | calc_vm_flag_bits(file, flags) |
 			mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
+	/* If uksm is enabled, we add VM_MERGEABLE to new VMAs. */
+	uksm_vm_flags_mod(&vm_flags);
 
 	/* Obtain the address to map to. we verify (or select) it and ensure
 	 * that it represents a valid section of the address space.
@@ -1313,6 +1316,7 @@ void exit_mmap(struct mm_struct *mm)
 	trace_exit_mmap(mm);
 destroy:
 	__mt_destroy(&mm->mm_mt);
+
 	mmap_write_unlock(mm);
 	vm_unacct_memory(nr_accounted);
 }
@@ -1465,6 +1469,7 @@ static struct vm_area_struct *__install_special_mapping(
 	vm_stat_account(mm, vma->vm_flags, len >> PAGE_SHIFT);
 
 	perf_event_mmap(vma);
+	uksm_add_vma_new(vma, "__install_special_mapping");
 
 	return vma;
 
@@ -1809,6 +1814,7 @@ __latent_entropy int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
 		 */
 		vma_iter_bulk_store(&vmi, tmp);
 
+		uksm_add_vma_new(tmp, "dup_mmap");
 		mm->map_count++;
 
 		if (tmp->vm_ops && tmp->vm_ops->open)

@@ -145,6 +145,11 @@ void vm_area_free(struct vm_area_struct *vma)
 {
 	/* The vma should be detached while being destroyed. */
 	vma_assert_detached(vma);
+#ifdef CONFIG_UKSM
+	if (vma->uksm_vma_slot)
+		pr_warn("vm_area_free: slot not null: vma = %p\n", vma);
+	BUG_ON(vma->uksm_vma_slot != NULL);
+#endif
 	vma_numab_state_free(vma);
 	free_anon_vma_name(vma);
 	vma_pfnmap_track_ctx_release(vma);

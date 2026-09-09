@@ -1288,6 +1288,9 @@ const char * const vmstat_text[] = {
 	[I(PGDEMOTE_DIRECT)]			= "pgdemote_direct",
 	[I(PGDEMOTE_KHUGEPAGED)]		= "pgdemote_khugepaged",
 	[I(PGDEMOTE_PROACTIVE)]			= "pgdemote_proactive",
+#ifdef CONFIG_UKSM
+	[I(NR_UKSM_ZERO_PAGES)]			= "nr_uksm_zero_pages",
+#endif
 #ifdef CONFIG_HUGETLB_PAGE
 	[I(NR_HUGETLB)]				= "nr_hugetlb",
 #endif
@@ -1941,9 +1944,15 @@ static int vmstat_show(struct seq_file *m, void *arg)
 	unsigned long *l = arg;
 	unsigned long off = l - (unsigned long *)m->private;
 
-	seq_puts(m, vmstat_text[off]);
-	seq_put_decimal_ull(m, " ", *l);
-	seq_putc(m, '\n');
+	/* Check for NULL pointer before calling seq_puts to avoid crash */
+	if (vmstat_text[off]) {
+		seq_puts(m, vmstat_text[off]);
+		seq_put_decimal_ull(m, " ", *l);
+		seq_putc(m, '\n');
+	} else {
+		/* Handle NULL entries gracefully */
+		seq_printf(m, "vmstat_%lu 0\n", off);
+	}
 
 	if (off == NR_VMSTAT_ITEMS - 1) {
 		/*
